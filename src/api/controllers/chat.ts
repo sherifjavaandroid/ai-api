@@ -93,7 +93,7 @@ async function requestToken(refreshToken: string) {
         validateStatus: () => true,
       }
     );
-    const { token } = checkResult(result, refreshToken);
+    const { biz_data: { token } } = checkResult(result, refreshToken);
     return {
       accessToken: token,
       refreshToken: token,
@@ -552,6 +552,8 @@ async function receiveStream(model: string, stream: any, refConvId?: string): Pr
   const isFoldModel = model.includes('fold');
   logger.info(`模型: ${model}, 是否思考: ${isThinkingModel} 是否联网搜索: ${isSearchModel}, 是否静默思考: ${isSilentModel}, 是否折叠思考: ${isFoldModel}`);
   let refContent = '';
+  // 追踪新格式的当前路径
+  let currentPath = '';
   return new Promise((resolve, reject) => {
     // 消息初始化
     const data = {
@@ -575,6 +577,56 @@ async function receiveStream(model: string, stream: any, refConvId?: string): Pr
         const result = _.attempt(() => JSON.parse(event.data));
         if (_.isError(result))
           throw new Error(`Stream response invalid: ${event.data}`);
+
+        // 新版DeepSeek流格式: {"p":"response/content","o":"APPEND","v":"Hello"}
+        if (result.v !== undefined) {
+          if (result.p) currentPath = result.p;
+
+          if (currentPath === "response/status" && result.v === "FINISHED") {
+            data.choices[0].message.content = data.choices[0].message.content.replace(/^\n+/, '').replace(/\[citation:\d+\]/g, '') + (refContent ? `\n\n搜索结果来自：\n${refContent}` : '');
+            resolve(data);
+            return;
+          }
+
+          if (currentPath === "response/thinking_content") {
+            if (isThinkingModel && !isSilentModel) {
+              if (isFoldModel) {
+                if (!thinking) {
+                  thinking = true;
+                  data.choices[0].message.content += "<details><summary>思考过程</summary><pre>";
+                }
+                data.choices[0].message.content += result.v;
+              } else {
+                data.choices[0].message.reasoning_content += result.v;
+              }
+            }
+            return;
+          }
+
+          if (currentPath === "response/content") {
+            if (thinking && isFoldModel) {
+              thinking = false;
+              data.choices[0].message.content += "</pre></details>";
+            }
+            data.choices[0].message.content += result.v;
+            return;
+          }
+
+          if (currentPath === "response/search_results") {
+            if (!isSilentModel) {
+              try {
+                const searchResults = typeof result.v === 'string' ? JSON.parse(result.v) : result.v;
+                if (Array.isArray(searchResults)) {
+                  refContent += searchResults.map(item => `${item.title} - ${item.url}`).join('\n');
+                }
+              } catch (e) {}
+            }
+            return;
+          }
+          return;
+        }
+
+        // 旧版格式兼容: {"choices":[{"delta":{"content":"..."}}]}
         if (!result.choices || !result.choices[0] || !result.choices[0].delta)
           return;
         if (!data.id)
@@ -637,6 +689,8 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
   logger.info(`模型: ${model}, 是否思考: ${isThinkingModel}, 是否联网搜索: ${isSearchModel}, 是否静默思考: ${isSilentModel}, 是否折叠思考: ${isFoldModel}`);
   // 消息创建时间
   const created = util.unixTimestamp();
+  // 追踪新格式的当前路径
+  let currentPath = '';
   // 创建转换流
   const transStream = new PassThrough();
   !transStream.closed &&
@@ -655,6 +709,21 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
         created,
       })}\n\n`
     );
+
+  const writeChunk = (id: string, delta: any, finishReason: string | null = null) => {
+    const chunk: any = {
+      id,
+      model,
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+      created,
+    };
+    if (finishReason === "stop") {
+      chunk.usage = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
+    }
+    !transStream.closed && transStream.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  };
+
   const parser = createParser((event) => {
     try {
       if (event.type !== "event" || event.data.trim() == "[DONE]") return;
@@ -662,6 +731,58 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
       const result = _.attempt(() => JSON.parse(event.data));
       if (_.isError(result))
         throw new Error(`Stream response invalid: ${event.data}`);
+
+      // 新版DeepSeek流格式: {"p":"response/content","o":"APPEND","v":"Hello"}
+      if (result.v !== undefined) {
+        if (result.p) currentPath = result.p;
+        const chunkId = refConvId || "";
+
+        if (currentPath === "response/status" && result.v === "FINISHED") {
+          writeChunk(chunkId, { role: "assistant", content: "" }, "stop");
+          !transStream.closed && transStream.end("data: [DONE]\n\n");
+          endCallback && endCallback();
+          return;
+        }
+
+        if (currentPath === "response/thinking_content") {
+          if (isThinkingModel && !isSilentModel) {
+            if (isFoldModel) {
+              if (!thinking) {
+                thinking = true;
+                writeChunk(chunkId, { role: "assistant", content: "<details><summary>思考过程</summary><pre>" });
+              }
+              writeChunk(chunkId, { role: "assistant", content: result.v });
+            } else {
+              writeChunk(chunkId, { role: "assistant", reasoning_content: result.v });
+            }
+          }
+          return;
+        }
+
+        if (currentPath === "response/content") {
+          if (thinking && isFoldModel) {
+            thinking = false;
+            writeChunk(chunkId, { role: "assistant", content: "</pre></details>" });
+          }
+          const deltaContent = String(result.v).replace(/\[citation:\d+\]/g, '');
+          writeChunk(chunkId, { role: "assistant", content: deltaContent });
+          return;
+        }
+
+        if (currentPath === "response/search_results" && !isSilentModel) {
+          try {
+            const searchResults = typeof result.v === 'string' ? JSON.parse(result.v) : result.v;
+            if (Array.isArray(searchResults) && searchResults.length > 0) {
+              const refContent = searchResults.map(item => `检索 ${item.title} - ${item.url}`).join('\n') + '\n\n';
+              writeChunk(chunkId, { role: "assistant", content: refContent });
+            }
+          } catch (e) {}
+          return;
+        }
+        return;
+      }
+
+      // 旧版格式兼容: {"choices":[{"delta":{"content":"..."}}]}
       if (!result.choices || !result.choices[0] || !result.choices[0].delta)
         return;
       result.model = model;
@@ -669,56 +790,21 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
         const searchResults = result.choices[0]?.delta?.search_results || [];
         if (searchResults.length > 0) {
           const refContent = searchResults.map(item => `检索 ${item.title} - ${item.url}`).join('\n') + '\n\n';
-          transStream.write(`data: ${JSON.stringify({
-            id: `${refConvId}@${result.message_id}`,
-            model: result.model,
-            object: "chat.completion.chunk",
-            choices: [
-              {
-                index: 0,
-                delta: { role: "assistant", content: refContent },
-                finish_reason: null,
-              },
-            ],
-          })}\n\n`);
+          writeChunk(`${refConvId}@${result.message_id}`, { role: "assistant", content: refContent });
         }
         return;
       }
       if (isFoldModel && result.choices[0].delta.type === "thinking") {
         if (!thinking && isThinkingModel && !isSilentModel) {
           thinking = true;
-          transStream.write(`data: ${JSON.stringify({
-            id: `${refConvId}@${result.message_id}`,
-            model: result.model,
-            object: "chat.completion.chunk",
-            choices: [
-              {
-                index: 0,
-                delta: { role: "assistant", content: isFoldModel ? "<details><summary>思考过程</summary><pre>" : "[思考开始]\n" },
-                finish_reason: null,
-              },
-            ],
-            created,
-          })}\n\n`);
+          writeChunk(`${refConvId}@${result.message_id}`, { role: "assistant", content: isFoldModel ? "<details><summary>思考过程</summary><pre>" : "[思考开始]\n" });
         }
         if (isSilentModel)
           return;
       }
       else if (isFoldModel && thinking && isThinkingModel && !isSilentModel) {
         thinking = false;
-        transStream.write(`data: ${JSON.stringify({
-          id: `${refConvId}@${result.message_id}`,
-          model: result.model,
-          object: "chat.completion.chunk",
-          choices: [
-            {
-              index: 0,
-              delta: { role: "assistant", content: isFoldModel ? "</pre></details>" : "\n\n[思考结束]\n" },
-              finish_reason: null,
-            },
-          ],
-          created,
-        })}\n\n`);
+        writeChunk(`${refConvId}@${result.message_id}`, { role: "assistant", content: isFoldModel ? "</pre></details>" : "\n\n[思考结束]\n" });
       }
 
       if (!result.choices[0].delta.content)
@@ -729,34 +815,10 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
           ? { role: "assistant", reasoning_content: deltaContent }
           : { role: "assistant", content: deltaContent };
 
-      transStream.write(`data: ${JSON.stringify({
-        id: `${refConvId}@${result.message_id}`,
-        model: result.model,
-        object: "chat.completion.chunk",
-        choices: [
-          {
-            index: 0,
-            delta,
-            finish_reason: null,
-          },
-        ],
-        created,
-      })}\n\n`);
+      writeChunk(`${refConvId}@${result.message_id}`, delta);
 
       if (result.choices && result.choices[0] && result.choices[0].finish_reason === "stop") {
-        transStream.write(`data: ${JSON.stringify({
-          id: `${refConvId}@${result.message_id}`,
-          model: result.model,
-          object: "chat.completion.chunk",
-          choices: [
-            {
-              index: 0,
-              delta: { role: "assistant", content: "" },
-              finish_reason: "stop"
-            },
-          ],
-          created,
-        })}\n\n`);
+        writeChunk(`${refConvId}@${result.message_id}`, { role: "assistant", content: "" }, "stop");
         !transStream.closed && transStream.end("data: [DONE]\n\n");
         endCallback && endCallback();
       }
@@ -808,7 +870,7 @@ async function getTokenLiveStatus(refreshToken: string) {
     }
   );
   try {
-    const { token } = checkResult(result, refreshToken);
+    const { biz_data: { token } } = checkResult(result, refreshToken);
     return !!token;
   }
   catch (err) {
