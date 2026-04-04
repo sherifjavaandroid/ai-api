@@ -6,7 +6,10 @@
         },
         {
             "src": "./dist/index.js",
-            "use": "@vercel/node"
+            "use": "@vercel/node",
+            "config": {
+                "includeFiles": ["sha3_wasm_bg.7b9ca65ddd.wasm"]
+            }
         }
     ],
     "routes": [
