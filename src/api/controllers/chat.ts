@@ -296,10 +296,12 @@ async function createCompletion(
     );
 
     // 发送事件，缓解被封号风险
-    await sendEvents(sessionId, refreshToken);
+    sendEvents(sessionId, refreshToken).catch(e => logger.error(e));
+
+    logger.info(`Response status: ${result.status}, content-type: ${result.headers["content-type"]}`);
 
     if (result.headers["content-type"].indexOf("text/event-stream") == -1) {
-      result.data.on("data", buffer => logger.error(buffer.toString()));
+      result.data.on("data", buffer => logger.error(`Non-SSE response: ${buffer.toString()}`));
       throw new APIException(
         EX.API_REQUEST_FAILED,
         `Stream response Content-Type invalid: ${result.headers["content-type"]}`
@@ -410,14 +412,16 @@ async function createCompletionStream(
     );
 
     // 发送事件，缓解被封号风险
-    await sendEvents(sessionId, refreshToken);
+    sendEvents(sessionId, refreshToken).catch(e => logger.error(e));
+
+    logger.info(`Stream response status: ${result.status}, content-type: ${result.headers["content-type"]}`);
 
     if (result.headers["content-type"].indexOf("text/event-stream") == -1) {
       logger.error(
         `Invalid response Content-Type:`,
         result.headers["content-type"]
       );
-      result.data.on("data", buffer => logger.error(buffer.toString()));
+      result.data.on("data", buffer => logger.error(`Non-SSE: ${buffer.toString()}`));
       const transStream = new PassThrough();
       transStream.end(
         `data: ${JSON.stringify({
