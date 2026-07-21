@@ -1,30 +1,10 @@
 {
-    "builds": [
+    "buildCommand": "npx tsup src/vercel.ts --format esm --platform node --target node18 --out-dir api --sourcemap=false",
+    "outputDirectory": "public",
+    "rewrites": [
         {
-            "src": "./dist/*.html",
-            "use": "@vercel/static"
-        },
-        {
-            "src": "./dist/index.js",
-            "use": "@vercel/node",
-            "config": {
-                "includeFiles": ["sha3_wasm_bg.7b9ca65ddd.wasm"]
-            }
-        }
-    ],
-    "routes": [
-        {
-            "src": "/",
-            "dest": "/dist/welcome.html"
-        },
-        {
-            "src": "/(.*)",
-            "dest": "/dist",
-            "headers": {
-                "Access-Control-Allow-Credentials": "true",
-                "Access-Control-Allow-Methods": "GET,OPTIONS,PATCH,DELETE,POST,PUT",
-                "Access-Control-Allow-Headers": "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Content-Type, Authorization"
-            }
+            "source": "/(.*)",
+            "destination": "/api/vercel"
         }
     ]
 }

@@ -1,5 +1,7 @@
 import fs from 'fs-extra';
 
+import { WASM_BASE64 } from './challenge-wasm.ts';
+
 export class DeepSeekHash {
   private wasmInstance: any;
   private offset: number = 0;
@@ -124,7 +126,11 @@ export class DeepSeekHash {
   // 初始化 WASM 模块
   public async init(wasmPath: string): Promise<any> {
     const imports = { wbg: {} };
-    const wasmBuffer = await fs.readFile(wasmPath);
+    // Prefer the embedded base64 WASM (works in serverless where the file read
+    // would fail); fall back to reading from disk if the embed is missing.
+    const wasmBuffer = WASM_BASE64
+      ? Buffer.from(WASM_BASE64, 'base64')
+      : await fs.readFile(wasmPath);
     const { instance } = await WebAssembly.instantiate(wasmBuffer, imports);
     this.wasmInstance = instance.exports;
     return this.wasmInstance;
