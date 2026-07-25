@@ -54,19 +54,26 @@ function safeParseToolJson(raw: string): any {
 
 /** parse <tool_call> blocks -> [{ id, name, input }] and cleaned text */
 function parseToolCalls(text: string): { content: string; toolCalls: any[] } {
+  // Some models (e.g. deepseek-reasoner) emit <tool_call> without a closing
+  // </tool_call>. Balance the tags so those still parse instead of leaking.
+  let t = text;
+  const opens = (t.match(/<tool_call>/g) || []).length;
+  const closes = (t.match(/<\/tool_call>/g) || []).length;
+  if (opens > closes) t += "</tool_call>".repeat(opens - closes);
+
   const toolCalls: any[] = [];
   const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
   let m: RegExpExecArray | null;
-  while ((m = regex.exec(text)) !== null) {
+  while ((m = regex.exec(t)) !== null) {
     const p = safeParseToolJson(m[1]);
     if (p && p.name) {
       const input = _.isString(p.arguments) ? safeParseToolJson(p.arguments) || {} : (p.arguments ?? {});
       toolCalls.push({ id: `toolu_${genId()}`, name: p.name, input });
     }
   }
-  let content = text.replace(regex, "").trim();
+  let content = t.replace(regex, "").trim();
   if (!toolCalls.length) {
-    const bare = safeParseToolJson(text);
+    const bare = safeParseToolJson(t);
     if (bare && bare.name && bare.arguments !== undefined) {
       toolCalls.push({ id: `toolu_${genId()}`, name: bare.name, input: bare.arguments ?? {} });
       content = "";
